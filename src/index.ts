@@ -6,6 +6,52 @@ import { z } from 'zod';
 import { whoisAsn, whoisDomain, whoisTld, whoisIp } from 'whoiser';
 import { green, red, yellow } from './utils.js'
 
+const config = {
+  timeout: parseInt(process.env.WHOIS_TIMEOUT || '1500', 10),
+  maxRetries: parseInt(process.env.WHOIS_MAX_RETRIES || '3', 10),
+  retryDelay: parseInt(process.env.WHOIS_RETRY_DELAY || '1000', 10),
+  follow: 2,
+} as const;
+
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  maxRetries: number,
+  delay: number,
+  isTimeout: (result: T) => boolean
+): Promise<T> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await fn();
+      if (isTimeout(result) && attempt < maxRetries) {
+        console.error(yellow(`⚠️ Timeout on attempt ${attempt + 1}, retrying in ${delay}ms...`));
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      return result;
+    } catch (err) {
+      lastError = err as Error;
+      if (lastError.message.toLowerCase().includes('timeout') && attempt < maxRetries) {
+        console.error(yellow(`⚠️ Timeout on attempt ${attempt + 1}, retrying in ${delay}ms...`));
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        throw lastError;
+      }
+    }
+  }
+  throw lastError ?? new Error('All retries timed out');
+}
+
+function hasTimeoutError(result: unknown): boolean {
+  if (typeof result !== 'object' || result === null) return false;
+  for (const value of Object.values(result)) {
+    if (typeof value === 'object' && value !== null && 'error' in value) {
+      return (value as Record<string, unknown>).error === 'Timeout';
+    }
+  }
+  return false;
+}
+
 function registerTools(server: McpServer) {
   //TOOL: Domain whois lookup
   server.tool(
@@ -14,7 +60,12 @@ function registerTools(server: McpServer) {
     { domain: z.string().min(1) },
     async ({ domain }) => {
       try {
-        const result = await whoisDomain(domain);
+        const result = await retryWithBackoff(
+          () => whoisDomain(domain, { timeout: config.timeout, follow: config.follow }),
+          config.maxRetries,
+          config.retryDelay,
+          hasTimeoutError
+        );
         return {
           content: [{ type: 'text', text: `Domain whois lookup for: \n${JSON.stringify(result)}` }],
         };
@@ -35,7 +86,12 @@ function registerTools(server: McpServer) {
     { tld: z.string().min(1) },
     async ({ tld }) => {
       try {
-        const result = await whoisTld(tld);
+        const result = await retryWithBackoff(
+          () => whoisTld(tld, config.timeout),
+          config.maxRetries,
+          config.retryDelay,
+          hasTimeoutError
+        );
         return {
           content: [{ type: 'text', text: `TLD whois lookup for: \n${JSON.stringify(result)}` }],
         };
@@ -56,7 +112,12 @@ function registerTools(server: McpServer) {
     { ip: z.string().ip() },
     async ({ ip }) => {
       try {
-        const result = await whoisIp(ip);
+        const result = await retryWithBackoff(
+          () => whoisIp(ip, { timeout: config.timeout }),
+          config.maxRetries,
+          config.retryDelay,
+          hasTimeoutError
+        );
         return {
           content: [{ type: 'text', text: `IP whois lookup for: \n${JSON.stringify(result)}` }],
         };
@@ -77,7 +138,12 @@ function registerTools(server: McpServer) {
     { asn: z.string().regex(/^AS\d+$/i).transform(s => parseInt(s.slice(2))) },
     async ({ asn }) => {
       try {
-        const result = await whoisAsn(asn);
+        const result = await retryWithBackoff(
+          () => whoisAsn(asn, { timeout: config.timeout }),
+          config.maxRetries,
+          config.retryDelay,
+          hasTimeoutError
+        );
         return {
           content: [{ type: 'text', text: `ASN whois lookup for: \n${JSON.stringify(result)}` }],
         };
